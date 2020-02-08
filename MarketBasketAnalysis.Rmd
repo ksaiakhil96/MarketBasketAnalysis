@@ -1,0 +1,960 @@
+---
+title: "Homework 3: That One That Brings It All Together"
+author: "Nakul Agrawal, Samira Arondekar, Sai Akhil Kodali, Xue Ni, Yuting Xin"
+date: "11/2/2019"
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 3
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '3'
+---
+\newpage
+
+# Introduction
+
+Central Perk is a boutique coffee shop which has not yet leveraged the potential of their data to gauge demand and understand their customer base. The client believes that they have a loyal customer base which has remained constant over the years. The owners of the coffee shop and its investors have sought our help in using this data to understand their customer base and generate more revenue from the business.
+
+The data needs to be thoroughly explored to validate the assumptions made by the client and explore dependence of demand on various factors.
+
+## The Business Problem
+The goal of the business is to maximize profit. This can be achieved in two ways. First way is by increasing sales to our current / new customers. Second way is to have a constant demand over time by making sure that we sell right products, at right price and at right time.
+
+As sales data has not yet been analysed, it has hampered the business's ability to make informed decisions based on consumer characteristics and demand patterns for the various products. The business wants to understand the variation of volume across seasons, weekdays and hour of day. They also want to check the performance of various items/products and trends for them.
+
+Based on the insights, the business would like recommendations about necessary changes that can be implemented to maximize profit. The business is wary of alienating customers as a result of any changes made.  
+
+## Who is a loyal customer?
+As the business's current practices assume that they have a loyal customer base, we first check if the customers are indeed loyal. Loyalty is defined as having made at least 5 or more purchases from Central Perk,made at least one purchase in the last 6 months and generated profits of at least $10. (Note that this is evaluated on sales instances with customer IDs as there is no other way to identify a customer). 
+
+
+## What does success looks like?
+Success here would result from increasing profit by effectively using sales data to identify patterns in demand and customer behavior and modify strategy/operations accordingly.
+
+## Approach
+Our first step is to explore the data by observing repeat visits by customers to gauge loyalty amongst customers. We further explore their contribution towards profits of the business.
+
+Next, we use association rules to understand sales by time element and  customer type. This helps us in identifying correlations which can be exploited to increase sales and possible scenarios for low sales.
+
+Further, we dig deeper into item level data using association rules to identify frequently co-occuring combinations which can be leveraged to increase sales and hence profits.
+
+Lastly we observe variation in demand across categories by time to find inconsistent demand. This information can be used to promote sales during low demand periods and optimize staffing to efficiently handle high/low demand to reduce costs.
+
+\newpage
+# Data Preparation
+We have a total of about 25 months transaction data spanning over 2016, 2017 and 2018.
+
+***Loading libraries and data:***
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(lubridate)
+library(timeDate)
+library(mltools)
+library(data.table)
+library(tidyr)
+library(ggplot2)
+library(arules)
+library(arulesViz)
+library(data.table)
+```
+
+```{r, warning=FALSE, message=FALSE}
+data_2016 <- read.csv("Central Perk Item Sales Summary 2017.csv")
+data_2017 <- read.csv("Central Perk Item Sales Summary 2016.csv")
+data_2018 <- read.csv("Central Perk Item Sales Summary 2018.csv")
+
+# Merging three datasets together
+data <- rbind(data_2016, data_2017, data_2018)
+```
+
+## Inspecting and Cleaning Data
+
+On inspection of the dataset, we found the following problems:
+
+* 'Notes' column showed some charges which were accidental and were not exactly a transaction (87 in total). This was reflected clearly in the 'Even.Type'
+* Price.Point.Name had 84 missing values.
+* Item column had non-interpretable names.
+* Discounts, Tax, Gross Sales and Net Sales were not in the right format.
+
+We deal with the above problems below:
+
+```{r, message=FALSE}
+# Selecting data with Event Type as 'Payment'
+data <- filter(data, Event.Type == 'Payment')
+
+# Dropping Notes and Event Type as they do not have any relevant information left
+data <- select(data, -c(Notes, Event.Type))
+
+# Dropping row with '' as category as it has no data
+data <- data %>%
+  filter(Category != '') %>%
+  droplevels()
+
+# Dropping rows from Price.Point.Name with missing values (84 rows)
+data <- data %>%
+  filter(Price.Point.Name != '') %>%
+  droplevels()
+
+# Correcting item name in Item Column
+levels(data$Item)[levels(data$Item) == "\U0001f34bLemonade\U0001f34b"] <- "Lemonade"
+
+# Converting Discounts column into correct format
+data$Discounts <- trimws(data$Discounts, which = "both")
+data$Discounts <- gsub("[$()]", "", data$Discounts)
+data$Discounts <- abs(as.numeric(data$Discounts))
+
+# Correcting Tax, Gross.Sale and Net.Sales
+strip_dollars = function(x) { as.numeric(gsub("[\\$, ]", "", x)) }
+data[ , c("Tax", "Gross.Sales", "Net.Sales")] <- 
+  lapply(data[ , c("Tax", "Gross.Sales", "Net.Sales")] , strip_dollars)
+
+# Converting Date column to right format
+data$Date <- as.Date(data$Date,"%m/%d/%y")
+```
+
+## Feature Engineering
+
+We performed feature engineering to add additional columns that could give us more information from the existing data.
+
+***Adding following variables:***
+
+1. weekday - Is a Weekday/Weekend (1/0)
+2. day_of_week - Mon, Tue, Wed, Thu, Fri, Sat
+3. profit - (20% of gross sale minus the discount)
+3. time_of_day - morning (opening to 11 am), afternoon (11am to 4 pm), evening (4 pm to closing)
+4. Customer - Is a Registered Customer/Non-Registered Customer (1/0)
+
+```{r, message=FALSE, results='hide'}
+# Adding a column for weekday
+data$Weekday <- isWeekday(data$Date, wday = 1:5)
+
+# Adding a colum for day_of_week
+data$day_of_week <- as.factor(weekdays(data$Date))
+
+# Adding a column for profit
+data$Profit <- (data$Gross.Sales * 0.2) - (data$Discounts)
+
+# Adding a colummn for time_of_day
+data$Time <- hms(data$Time)
+data$time_of_day <- ifelse(lubridate::hour(data$Time) <= 10, 'Morning',
+                           (ifelse(lubridate::hour(data$Time) <= 15, 'Afternoon',
+                                   'Evening')))
+
+# Adding a flag for customer
+data$Customer <- ifelse(is.na(data$Customer.ID), 'Non-Registered Customer',
+                        'Registered Customer')
+data$Customer <- as.factor(data$Customer)
+```
+
+***summary of dataframe***
+
+```{r, message=FALSE}
+str(data, max.level = 1, strict.width = "wrap")
+```
+
+We now have a clean and well prepared dataset which can be used for data transformation, exploration and extracting insights.
+
+## Data Transformation
+
+We transformed data into two levels:
+
+1. First, we grouped by time and got data at an order level. This is done to find insights like what products are frequently bougth together, etc.:
+
+```{r, echo=FALSE, eval=FALSE}
+data_dummy <- one_hot(as.data.table(data), cols = c('Category', 'Item'))
+names(data_dummy) <- gsub(" ", "_", names(data_dummy))
+names(data_dummy) <- gsub("-", "_", names(data_dummy))
+names(data_dummy) <- gsub("/", "_", names(data_dummy))
+
+# Multiplying Qty with items to get the correct number of orders
+
+cols = c('Item_Lemonade', 'Item_12oz_Columbia', 'Item_12oz_Costa_Rican', 'Item_12oz_Ethio', 'Item_12oz_Gautemala', 'Item_12oz_Hair', 'Item_12oz_Snow_Day', 'Item_Almond', 'Item_Almond_Rasp', 'Item_Americano', 'Item_Au_Lait', 'Item_Au_Lait_LG', 'Item_Blue_Point_Lager', 'Item_Cappucino', 'Item_Cortado', 'Item_Croissant', 'Item_Donut', 'Item_Drip_LG', 'Item_Drip_SM', 'Item_Espresso', 'Item_Extra_Shot', 'Item_Financier', 'Item_Hot_Chocolate', 'Item_Ice', 'Item_Lagunitas_IPA', 'Item_Latte_LG', 'Item_Latte_SM', 'Item_Lenka_Bar', 'Item_Macchiato', 'Item_Mocha', 'Item_Perrier', 'Item_San_Pellegrino', 'Item_Sierra_Nevada_PA', 'Item_Six_Point_Pilsner', 'Item_Soy', 'Item_Steamed_Milk', 'Item_Stubby', 'Item_Tea_LG', 'Item_Tea_SM', 'Item_Abita_Amber', 'Item_Alm_Rasp', 'Item_Apple', 'Item_Banana', 'Item_Cereal', 'Item_Chai', 'Item_Colo_Indo', 'Item_Colombian', 'Item_CostaR', 'Item_DblChoc', 'Item_EspMac', 'Item_Ethiopian', 'Item_Goji', 'Item_Guat_Papua', 'Item_Hairbender', 'Item_MapleVal', 'Item_Peru_Costa', 'Item_Purple_Haze', 'Item_Snow_Day', 'Item_SweetPo', 'Item_12oz_Bella', 'Item_12oz_Colom', 'Item_12oz_Honduras', 'Item_12oz_Indo', 'Item_Alm_Blu', 'Item_Anchor', 'Item_Crisp', 'Item_Lagunitas', 'Item_Oat', 'Item_Ommegang')
+
+data_dummy <- data_dummy[ , (cols) := lapply(.SD, "*", data_dummy$Qty), .SDcols = cols]
+
+# Leaving the information from Price.Point.Name and Qty, but retaining all other information
+data_orders <- data_dummy %>%
+  group_by(Date, Time) %>%
+  summarise(Gross.Sales = sum(Gross.Sales),
+            Discounts = sum(Discounts),
+            Net.Sales = sum(Net.Sales),
+            Tax = sum(Tax),
+            Profit = sum(Profit),
+            Customer.ID = first(Customer.ID),
+            Weekday = first(Weekday),
+            day_of_week = first(day_of_week),
+            Time_2 = first(Time_2),
+            time_of_day = first(time_of_day),
+            Customer = first(Customer),
+            Category_Beans = sum(Category_Beans),
+Category_Beers = sum(Category_Beers),
+Category_Coffee = sum(Category_Coffee),
+Category_Extras = sum(Category_Extras),
+Category_Food = sum(Category_Food),
+Category_Non_Caffeinated_Drinks = sum(Category_Non_Caffeinated_Drinks),
+Category_None = sum(Category_None),
+Category_Tea = sum(Category_Tea),
+Category_Cereal = sum(Category_Cereal),
+Item_Lemonade = sum(Item_Lemonade),
+Item_12oz_Columbia = sum(Item_12oz_Columbia),
+Item_12oz_Costa_Rican = sum(Item_12oz_Costa_Rican),
+Item_12oz_Ethio = sum(Item_12oz_Ethio),
+Item_12oz_Gautemala = sum(Item_12oz_Gautemala),
+Item_12oz_Hair = sum(Item_12oz_Hair),
+Item_12oz_Snow_Day = sum(Item_12oz_Snow_Day),
+Item_Almond = sum(Item_Almond),
+Item_Almond_Rasp = sum(Item_Almond_Rasp),
+Item_Americano = sum(Item_Americano),
+Item_Au_Lait = sum(Item_Au_Lait),
+Item_Au_Lait_LG = sum(Item_Au_Lait_LG),
+Item_Blue_Point_Lager = sum(Item_Blue_Point_Lager),
+Item_Cappucino = sum(Item_Cappucino),
+Item_Cortado = sum(Item_Cortado),
+Item_Croissant = sum(Item_Croissant),
+Item_Donut = sum(Item_Donut),
+Item_Drip_LG = sum(Item_Drip_LG),
+Item_Drip_SM = sum(Item_Drip_SM),
+Item_Espresso = sum(Item_Espresso),
+Item_Extra_Shot = sum(Item_Extra_Shot),
+Item_Financier = sum(Item_Financier),
+Item_Hot_Chocolate = sum(Item_Hot_Chocolate),
+Item_Ice = sum(Item_Ice),
+Item_Lagunitas_IPA = sum(Item_Lagunitas_IPA),
+Item_Latte_LG = sum(Item_Latte_LG),
+Item_Latte_SM = sum(Item_Latte_SM),
+Item_Lenka_Bar = sum(Item_Lenka_Bar),
+Item_Macchiato = sum(Item_Macchiato),
+Item_Mocha = sum(Item_Mocha),
+Item_Perrier = sum(Item_Perrier),
+Item_San_Pellegrino = sum(Item_San_Pellegrino),
+Item_Sierra_Nevada_PA = sum(Item_Sierra_Nevada_PA),
+Item_Six_Point_Pilsner = sum(Item_Six_Point_Pilsner),
+Item_Soy = sum(Item_Soy),
+Item_Steamed_Milk = sum(Item_Steamed_Milk),
+Item_Stubby = sum(Item_Stubby),
+Item_Tea_LG = sum(Item_Tea_LG),
+Item_Tea_SM = sum(Item_Tea_SM),
+Item_Abita_Amber = sum(Item_Abita_Amber),
+Item_Alm_Rasp = sum(Item_Alm_Rasp),
+Item_Apple = sum(Item_Apple),
+Item_Banana = sum(Item_Banana),
+Item_Cereal = sum(Item_Cereal),
+Item_Chai = sum(Item_Chai),
+Item_Colo_Indo = sum(Item_Colo_Indo),
+Item_Colombian = sum(Item_Colombian),
+Item_CostaR = sum(Item_CostaR),
+Item_DblChoc = sum(Item_DblChoc),
+Item_EspMac = sum(Item_EspMac),
+Item_Ethiopian = sum(Item_Ethiopian),
+Item_Goji = sum(Item_Goji),
+Item_Guat_Papua = sum(Item_Guat_Papua),
+Item_Hairbender = sum(Item_Hairbender),
+Item_MapleVal = sum(Item_MapleVal),
+Item_Peru_Costa = sum(Item_Peru_Costa),
+Item_Purple_Haze = sum(Item_Purple_Haze),
+Item_Snow_Day = sum(Item_Snow_Day),
+Item_SweetPo = sum(Item_SweetPo),
+Item_12oz_Bella = sum(Item_12oz_Bella),
+Item_12oz_Colom = sum(Item_12oz_Colom),
+Item_12oz_Honduras = sum(Item_12oz_Honduras),
+Item_12oz_Indo = sum(Item_12oz_Indo),
+Item_Alm_Blu = sum(Item_Alm_Blu),
+Item_Anchor = sum(Item_Anchor),
+Item_Crisp = sum(Item_Crisp),
+Item_Lagunitas = sum(Item_Lagunitas),
+Item_Oat = sum(Item_Oat),
+Item_Ommegang = sum(Item_Ommegang))
+# write.csv(data_orders, "data_orders.csv")
+```
+
+```{r, echo=FALSE}
+data_orders <- read.csv('data_orders.csv')
+str(data_orders, max.level = 1, list.len = 25, strict.width = "wrap")
+```
+
+2. We also grouped data and got it to customer level for deeper consumer analysis:
+
+```{r, echo=FALSE, eval=FALSE}
+# importing data_orders here
+# data_orders <- read.csv('data_orders.csv')
+
+# Transforming to customer level. Adding columns for total_orders and days_since_last_order
+data_customers <- data_orders %>%
+  filter(Customer == 1) %>%
+  group_by(Customer.ID) %>%
+  summarise(Gross.Sales = sum(Gross.Sales),
+            Discounts = sum(Discounts),
+            Net.Sales = sum(Net.Sales),
+            Tax = sum(Tax),
+            Profit = sum(Profit),
+            days_since_last_order = as.Date('2018-08-24') - max(Date),
+            total_orders = n(),
+            Category_Beans = sum(Category_Beans),
+Category_Beers = sum(Category_Beers),
+Category_Coffee = sum(Category_Coffee),
+Category_Extras = sum(Category_Extras),
+Category_Food = sum(Category_Food),
+Category_Non_Caffeinated_Drinks = sum(Category_Non_Caffeinated_Drinks),
+Category_None = sum(Category_None),
+Category_Tea = sum(Category_Tea),
+Category_Cereal = sum(Category_Cereal),
+Item_Lemonade = sum(Item_Lemonade),
+Item_12oz_Columbia = sum(Item_12oz_Columbia),
+Item_12oz_Costa_Rican = sum(Item_12oz_Costa_Rican),
+Item_12oz_Ethio = sum(Item_12oz_Ethio),
+Item_12oz_Gautemala = sum(Item_12oz_Gautemala),
+Item_12oz_Hair = sum(Item_12oz_Hair),
+Item_12oz_Snow_Day = sum(Item_12oz_Snow_Day),
+Item_Almond = sum(Item_Almond),
+Item_Almond_Rasp = sum(Item_Almond_Rasp),
+Item_Americano = sum(Item_Americano),
+Item_Au_Lait = sum(Item_Au_Lait),
+Item_Au_Lait_LG = sum(Item_Au_Lait_LG),
+Item_Blue_Point_Lager = sum(Item_Blue_Point_Lager),
+Item_Cappucino = sum(Item_Cappucino),
+Item_Cortado = sum(Item_Cortado),
+Item_Croissant = sum(Item_Croissant),
+Item_Donut = sum(Item_Donut),
+Item_Drip_LG = sum(Item_Drip_LG),
+Item_Drip_SM = sum(Item_Drip_SM),
+Item_Espresso = sum(Item_Espresso),
+Item_Extra_Shot = sum(Item_Extra_Shot),
+Item_Financier = sum(Item_Financier),
+Item_Hot_Chocolate = sum(Item_Hot_Chocolate),
+Item_Ice = sum(Item_Ice),
+Item_Lagunitas_IPA = sum(Item_Lagunitas_IPA),
+Item_Latte_LG = sum(Item_Latte_LG),
+Item_Latte_SM = sum(Item_Latte_SM),
+Item_Lenka_Bar = sum(Item_Lenka_Bar),
+Item_Macchiato = sum(Item_Macchiato),
+Item_Mocha = sum(Item_Mocha),
+Item_Perrier = sum(Item_Perrier),
+Item_San_Pellegrino = sum(Item_San_Pellegrino),
+Item_Sierra_Nevada_PA = sum(Item_Sierra_Nevada_PA),
+Item_Six_Point_Pilsner = sum(Item_Six_Point_Pilsner),
+Item_Soy = sum(Item_Soy),
+Item_Steamed_Milk = sum(Item_Steamed_Milk),
+Item_Stubby = sum(Item_Stubby),
+Item_Tea_LG = sum(Item_Tea_LG),
+Item_Tea_SM = sum(Item_Tea_SM),
+Item_Abita_Amber = sum(Item_Abita_Amber),
+Item_Alm_Rasp = sum(Item_Alm_Rasp),
+Item_Apple = sum(Item_Apple),
+Item_Banana = sum(Item_Banana),
+Item_Cereal = sum(Item_Cereal),
+Item_Chai = sum(Item_Chai),
+Item_Colo_Indo = sum(Item_Colo_Indo),
+Item_Colombian = sum(Item_Colombian),
+Item_CostaR = sum(Item_CostaR),
+Item_DblChoc = sum(Item_DblChoc),
+Item_EspMac = sum(Item_EspMac),
+Item_Ethiopian = sum(Item_Ethiopian),
+Item_Goji = sum(Item_Goji),
+Item_Guat_Papua = sum(Item_Guat_Papua),
+Item_Hairbender = sum(Item_Hairbender),
+Item_MapleVal = sum(Item_MapleVal),
+Item_Peru_Costa = sum(Item_Peru_Costa),
+Item_Purple_Haze = sum(Item_Purple_Haze),
+Item_Snow_Day = sum(Item_Snow_Day),
+Item_SweetPo = sum(Item_SweetPo),
+Item_12oz_Bella = sum(Item_12oz_Bella),
+Item_12oz_Colom = sum(Item_12oz_Colom),
+Item_12oz_Honduras = sum(Item_12oz_Honduras),
+Item_12oz_Indo = sum(Item_12oz_Indo),
+Item_Alm_Blu = sum(Item_Alm_Blu),
+Item_Anchor = sum(Item_Anchor),
+Item_Crisp = sum(Item_Crisp),
+Item_Lagunitas = sum(Item_Lagunitas),
+Item_Oat = sum(Item_Oat),
+Item_Ommegang = sum(Item_Ommegang))
+```
+
+```{r, echo=FALSE}
+data_customers <- read.csv('data_customers.csv')
+str(data_customers, max.level = 1, list.len = 20, strict.width = "wrap")
+```
+
+Our data transformation is now complete and we proceed with our data analysis.
+
+\newpage
+
+# Data Analysis
+
+## Part 1 - Testing hypothesis 'Is our customer base loyal?'
+
+*Overview*
+
+We want to analyze the hypothesis that most of the profits are brought in by our loyal customers. From the dataset we can see some customers have an ID, and we assume they have registered an account with us similar to the 'Starbucks Rewards Program'. For customers with customer ID, we identify them as "Registered Customers". For those customers without any ID, we consider them as "Non-Registered Customers". 
+
+
+*Analysis of Profit by Customer type*
+```{r}
+ggplot(data, aes(x = format(as.Date(data$Date), "%Y-%m"), y = Profit,
+                 color = Customer, fill = Customer, width = 0.5)) +
+  geom_bar(stat = "identity") +
+  labs(title = 'Profit from Customers(by each month)',
+       y = "Profit", x = "Year and Month") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+*Interpretation*
+
+As we can see above, during the three year period, the profit distribution by Registered vs Non-Registered Customers is relatively stable. By calculation, we see that about two thirds of profits are brought by registered customers.
+
+
+*Analysis of Quantity sold by Customer type*
+```{r}
+ggplot(data, aes(x = format(as.Date(data$Date), "%Y-%m"), y = Qty,
+                 color = Customer, fill = Customer, width = 0.5)) +
+  geom_bar(stat = "identity") +
+  labs(title = 'Quantity sold to Customers (by each month)',
+       y = "Quantity", x = "Year and Month") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+*Interpretation*
+
+As we can see above, the analysis of quantity sold matches our result from previous graph. By calculation, we see that again, about two thirds of quantity are sold to registered customers. Based on analysis above, we can see the reason why our client believes the priority is to maintain loyalty customers. However, are these registered customers really loyal to our coffee shop? We study the data further in this direction.
+
+
+
+*Overview*
+
+We further explore our registered customers. We want to know for how many days they have been our customers, how many transactions they have made, along with how much money they have spent at our coffee shop.
+
+
+
+*Analysis of Transactions made*
+
+```{r, warning=FALSE}
+ggplot(data_customers, aes(x = total_orders)) +
+  geom_histogram(bins = 80) +
+  labs(title = 'Distribution of number of transactions',
+       y = "Count of Registered Customers",
+       x = "No. of Transactions made") +
+  xlim(0,40)
+```
+
+*Interpretation*
+
+We can see from the above graph that majority of our registered customers make very few transactions with us. Only a handful of customers make over 20 purchases from us. Of all the registered customers, 76% made just a single transaction.
+
+Next we analyze the timeline of transactions of our customers.
+
+
+
+*Analysis of profit vs last ordered date*
+
+```{r}
+ggplot(data_customers, aes(x = days_since_last_order, y = Profit)) +
+  geom_point(alpha = 0.15, color = 'red') +
+  labs(title = 'Profit vs Days Last Ordered', y = "Total profit", x = "Days")
+```
+
+*Interpretation*
+
+In this plot, each point represents a customer. We see that most of our customers have not made a purcahse with us for quite some time. For some reason, our customers do not return to our store to make another purchase again.
+
+
+*Recency and Frequency Analysis for Loyal Customers*
+
+Finally we look at customers with whom we have had a good relation. We have set our expectations low and defined a loyal customer as below:
+1. The customer should have visited the cafe at least 5 times  
+2. The customer should have visited at least once in last 6 months  
+3. The customer should have at least made a profit of $10 for the business  
+
+```{r}
+data_customers %>% filter(days_since_last_order < 180 & total_orders > 4 & Profit > 10) %>%
+  summarise(percentage_of_people = (n()/31811)*100, Avg_Profit = mean(Profit))
+```
+
+*Interpretation*
+
+Only 2.3% of our total 'Registered Customers' actually pass the above criteria and can be said to be loyal. This is a very low number as compared to the total number of registered customers. These customers generate a profit of $34 on average.
+
+
+
+*Analysing Extras - Loyal Customers Vs All*
+
+We found that loyal customers are more likely to buy 'extras' with their coffee.
+
+```{r}
+# For Loyal Customers
+data_customers %>%
+  filter(days_since_last_order < 180 & total_orders > 4 &
+           Profit > 10 & Category_Extras > 1) %>%
+  summarise(percentage_of_people = (n()/734)*100, Avg_Profit = mean(Profit))
+```
+
+```{r}
+# For all Registered Customers
+data_customers %>% filter(Category_Extras > 1) %>%
+  summarise(percentage_of_people = (n()/31811)*100, Avg_Profit = mean(Profit))
+```
+
+*Interpretation*
+ 
+Only 15% of all our customers have ever bought an 'extra'. Whereas, out of the loyal customers, around 80% have bought extras.
+
+Hence, it is safe to say that buying extras is an important characteristic of a loyal customer and if the cafe can start giving extras at a low price or for free, they can make more customers as their loyal customers and retain the existing ones. We will deep dive into Extras in the next part of our analysis.
+
+
+
+*Conclusion of Part 1*
+
+From our analysis on our customers, we can see that most of our profits are brought in by registered customers and similarly, we see most of our products are sold to these existing customers.
+
+However, most of our registered customers make only few transactions with us and they are not loyal to us in terms of duration and frequency. From these evidences we can conclude that our client's hypothesis that their customer base is loyal, is incorrect. Even though our client does a good job making customers register an account with them, client fails to turn them into loyal customers. 
+
+We can see that most of the customers are not returning. Even the customers who have made us good profit in the past, have stopped coming to our shop.
+
+We also saw that buying products from category Extras is an important characteristic of a loyal customer.
+
+Hence, our client needs to increase loyal customers from their registered customer base.
+
+\newpage
+
+## Part 2 - What is the buying behavior (by time) of our customers?
+
+*Overview*
+
+From previous observations, we see that our client's business is very easily affected by time variables (such as season and weekday). Hence, we will run association rules here to see how each category of product is affected by time and different types of customers. 
+
+Following is how we have seperated our time variables:
+
+* By Season
+  + Spring: March-May
+  + Summer: June-August
+  + Fall: September-November
+  + Winter: December-February
+
+* By Time of Day
+  + Morning: Before 10am
+  + Afternoon: 10am-3pm
+  + Evening: After 3pm
+
+* By Day of Week
+  + Weekday: Monday-Friday
+  + Weekend: Saturday & Sunday
+
+
+```{r, echo = FALSE, eval=FALSE}
+data$Month <- months(as.Date(data$Date))
+
+data$Season[data$Month == 'March' | data$Month == 'April' | data$Month == 'May'] <- 'Spring'
+data$Season[data$Month == 'June' | data$Month == 'July' | data$Month == 'August'] <- 'Summer'
+data$Season[data$Month == 'September' | data$Month == 'October' | data$Month == 'November'] <- 'Fall'
+data$Season[data$Month == 'December' | data$Month == 'January' | data$Month == 'February'] <- 'Winter'
+
+data$Weekday[data$Weekday == 'FALSE'] <- 'weekend'
+data$Weekday[data$Weekday == 'TRUE'] <- 'weekday'
+
+data$Customer[data$Customer == 1] <- 'Registered Customer'
+data$Customer[data$Customer == 0] <- 'Non-Registered Customer'
+
+rule <- data[,c('Category','Customer','time_of_day','Weekday','Season')]
+```
+
+```{r}
+transactions <- read.transactions("arules_1.csv", format = "basket", sep = ',')
+```
+
+```{r, results='hide'}
+rules <- apriori(transactions, parameter = list(supp = 0.0001, conf = 0.05))
+```
+
+*1. Analysis of rules with largest and smallest lift*
+First, we want to take a look at all rules and then find rules with the largest lift and smallest lift. 
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = TRUE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" |
+                      rhs %pin% "Summer" | rhs %pin% "Spring" |
+                      rhs %pin% "Morning" | rhs %pin% "Evening" |
+                      rhs %pin% "Afternoon" | rhs %pin% "weekend" |
+                      rhs %pin% "weekday" | rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift > 2.3) %>%
+  inspect()
+```
+
+
+```{r}
+rules <- sort(rules,by = "lift", decreasing = FALSE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" | rhs %pin% "Summer" |
+                      rhs %pin% "Spring" | rhs %pin% "Morning" |
+                      rhs %pin% "Evening" | rhs %pin% "Afternoon" |
+                      rhs %pin% "weekend" | rhs %pin% "weekday" |
+                      rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift < 0.7) %>%
+  inspect()
+```
+
+*Interpretation*
+
+We want to see relationships with the largest and weakest lift. As we can see, in winter evening, customers are very likely to buy tea and non-caffeinated drinks, with a lift over 2.3, which is very high.
+Then we look into relationships with the weakest lift. This tells us about the unlikeliness of a rule. Top 10 rules all related to food. We can conclude from the results that customers are very less likely to buy food on a summer afternoon and summer evening. 
+It is very clear that our client can have some promotions here, relating to tea and non-caffeinated drinks in winter to boost sales. Also, client should consider cutting down the order for food from suppliers in summer since there is not much sales in food in this season.
+
+
+*2. Analysis of rules related to just coffee and food*
+
+Since most of our profits are brought in by food category and coffee category, we want to focus on rules relating to coffee and food. 
+
+*a. coffee*
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = TRUE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" | rhs %pin% "Summer" |
+                      rhs %pin% "Spring" | rhs %pin% "Morning" | rhs %pin% "Evening" |
+                      rhs %pin% "Afternoon" | rhs %pin% "weekend" |
+                      rhs %pin% "weekday" | rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift > 1.12) %>%
+  subset(subset = (rhs %pin% 'Coffee')) %>%
+  inspect()
+```
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = FALSE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" | rhs %pin% "Summer" |
+                      rhs %pin% "Spring" | rhs %pin% "Morning" | rhs %pin% "Evening" |
+                      rhs %pin% "Afternoon" | rhs %pin% "weekend" |
+                      rhs %pin% "weekday" | rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift < 0.85) %>%
+  subset(subset = (rhs %pin% 'Coffee')) %>%
+  inspect()
+```
+
+*Interpretation*
+
+Here we generate rules relating to coffee with lift greater than 1.1 and lift less than 0.85. 
+
+We can see that new customers are more likely to buy coffee and more quantity is sold in the morning period. However, we should keep in mind that the lift is about 1.1, which is not very significant. Registered Customers are less likely to buy coffee in summer and in the afternoon or evening.
+
+We can conclude here that morning is the period that our client sells most coffee. Also, non-registered customers are more likely to buy coffee from our client in the morning. Our client should definitely come out with some strategies to attract customers in the morning period. We can also conclude that the sales of our coffee are relatively stable since there are not vey large or very small lift from these rules.
+
+*b. food*
+
+Now we explore the food section in the store. This will help us understand how the food items fare with customers.
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = TRUE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" | rhs %pin% "Summer" |
+                      rhs %pin% "Spring" | rhs %pin% "Morning" | rhs %pin% "Evening" |
+                      rhs %pin% "Afternoon" | rhs %pin% "weekend" |
+                      rhs %pin% "weekday" | rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift > 1.3) %>%
+  subset(subset = (rhs %pin% 'Food')) %>%
+  inspect()
+```
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = FALSE)
+rules %>%
+  subset(subset = !(rhs %pin% "Winter" | rhs %pin% "Fall" | rhs %pin% "Summer" |
+                      rhs %pin% "Spring" | rhs %pin% "Morning" | rhs %pin% "Evening" |
+                      rhs %pin% "Afternoon" | rhs %pin% "weekend" |
+                      rhs %pin% "weekday" | rhs %pin% "Non-Registered Customer" |
+                      rhs %pin% "Registered Customer" | rhs %pin% "Extras" )) %>%
+  subset(subset = lift < 0.75) %>%
+  subset(subset = (rhs %pin% 'Food')) %>%
+  inspect()
+```
+
+*Interpretation*
+
+We can clearly see some trends here. Registered customers are more likely to buy food in morning and generally customers are less likely to buy food in afternoon or evening. Non-registered customers are less likely to try our food and registered customers are more likely to buy food. This means the quality of our food is approved by our registered customers and our client should find a way to make more customers try our food.
+
+*Conclusions of Part 2:*
+
+There are many rules tnat can be generated. Here we only list that we think are most applicable and have a huge potential. Later in the report, we have provided our recommendations based on these insights.
+
+1. Customers are much more likely to buy tea and non-caffenaited drinks in winter evening.
+
+2. Most of the coffee and food are sold in the morning. Sales of them drop a lot in afternoon and evening, especially in the summer.
+
+3. Registered customers like our food and non-registered customers are less likely to buy our food. This indicates that our food has good taste but not attractive to new customers.
+
+\newpage
+
+## Part 3 - What is the buying pattern (by type of items) of our customers?
+
+
+*Overview*
+
+Sometimes customers buy more than one item in one transaction. Here we want to know which set of items are more or less likely to appear together.
+
+We took the following steps for convenience of our analysis and improve the insights:
+1. Combined large/small orders of latte, drip, and tea together
+2. Analyze items which sold over 1,000 times.
+
+```{r, echo=FALSE, eval = FALSE}
+orders <- read.csv('data_orders.csv')
+orders$latte <- orders$Item_Latte_LG + orders$Item_Latte_SM
+orders$drip <- orders$Item_Drip_LG + orders$Item_Drip_SM
+orders$tea <- orders$Item_Tea_LG + orders$Item_Tea_SM
+
+items <- orders[c('Item_Almond','Item_Americano','Item_Cappucino','Item_Chai','Item_Cortado','Item_Croissant','Item_Donut','drip','Item_Espresso','Item_Extra_Shot','Item_Financier','Item_Hot_Chocolate','Item_Ice','latte','Item_Lenka_Bar','Item_Macchiato','Item_Mocha','Item_Perrier','Item_Soy','tea')]
+
+items$Item_Almond[items$Item_Almond!=0]<-'Almond'
+items$Item_Americano[items$Item_Americano!=0]<-'Americano'
+items$Item_Cappucino[items$Item_Cappucino!=0]<-'Cappucino'
+items$Item_Chai[items$Item_Chai!=0]<-'Chai'
+items$Item_Cortado[items$Item_Cortado!=0]<-'Cortado'
+items$Item_Croissant[items$Item_Croissant!=0]<-'Croissant'
+items$Item_Donut[items$Item_Donut!=0]<-'Donut'
+items$drip[items$drip!=0]<-'Drip'
+items$Item_Espresso[items$Item_Espresso!=0]<-'Espresso'
+items$Item_Extra_Shot[items$Item_Extra_Shot!=0]<-'Extra Shot'
+items$Item_Financier[items$Item_Financier!=0]<-'Financier'
+items$Item_Hot_Chocolate[items$Item_Hot_Chocolate!=0]<-'Hot Chocalate'
+items$Item_Ice[items$Item_Ice!=0]<-'Ice'
+items$latte[items$latte!=0]<-'Latte'
+items$Item_Lenka_Bar[items$Item_Lenka_Bar!=0]<-'Lenka Bar'
+items$Item_Macchiato[items$Item_Macchiato!=0]<-'Macchiato'
+items$Item_Mocha[items$Item_Mocha!=0]<-'Mocha'
+items$Item_Perrier[items$Item_Perrier!=0]<-'Perrier'
+items$Item_Soy[items$Item_Soy!=0]<-'Soy'
+items$tea[items$tea!=0]<-'Tea'
+items[items == 0] <- NA
+```
+
+```{r, results='hide'}
+itemarules = read.transactions("items_1.csv", format = "basket", sep = ",")
+```
+
+```{r, results='hide'}
+rules <- apriori(itemarules, parameter = list(supp = 0.0005, conf = 0.05))
+```
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = TRUE)
+rules %>%
+  subset(subset = lift > 3) %>%
+  inspect()
+```
+
+*Interpretation*
+
+Here we only select rules with a lift more than 3. Several observations we can draw from our list of rules.
+
+1. Customers are more likely to buy more items such as almond milk, croissant, and donut when they purchase Latte. It means that increasing the sales of Latte will also increase the sales of many other products. 
+
+2. Customers have a very high lift to order extra shot when they order Chai tea. It would be a great idea to introduce a new tea drink with a stronger flavor. 
+
+
+```{r}
+rules <- sort(rules, by = "lift", decreasing = FALSE)
+rules %>%
+  subset(subset = lift < 0.3) %>%
+  inspect()
+```
+
+*Interpretation*
+Here we only select rule with a lift less than 0.3. It is very surprising that 19 out of 20 rules we get are relating to Drip. A conclusion here in most of the time customers who buy Drip are not likely to buy anything else with it. And hence Drip is a product which gets sold without pairing with any other product. This also shows that customers who purchase Drip are very different from customers who purchase other products.  
+
+\newpage
+
+## Part 4 - What are the patterns in demand across categories and time?
+
+*Overview*
+
+The main objective of this part is to find out how are the coffee purchasing patterns with regards to sales volume, across categories and items. This way we can find the potential inconsistent demand from customers that can lead us to recommendations. 
+
+```{r, echo = FALSE}
+data$Item <- as.character(data$Item)
+data$Item[data$Item == "Latte SM"] <- "Latte"
+data$Item[data$Item == "Latte LG"] <- "Latte"
+data$Item[data$Item == "Drip SM"] <- "Drip"
+data$Item[data$Item == "Drip LG"] <- "Drip"
+```
+
+
+*Sales Volume Analysis by Category*
+
+First, let's look at sales by Category
+```{r}
+data %>%
+  mutate(month = lubridate::month(Date, label = TRUE)) %>%
+  group_by(month, Category) %>%
+  summarise(tol_qty = sum(Qty)) %>%
+  ggplot(aes(month, tol_qty)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'Quantity of Category items, sold over time', y = "Items sold", x = "Date") +
+  facet_wrap(.~Category)
+```
+
+*Interpretation*
+
+At a glimpse, Central Perk’s business focuses on Coffee and Food categories, which doesn't come as a surprise! Oddly, we also see high sales in Extras during the month of July and August. So lets narrow down to only Coffee and Food along with Extras and see what is going on.
+
+*Sales Volume Analysis by Items*
+
+Now, we look at most sold items in each of three categories i.e. Coffee, Food and Extras
+
+```{r}
+data %>%
+  filter(Category %in% c('Coffee', 'Extras', 'Food')) %>%
+  group_by(Category, Item) %>%
+  summarise(Tol_qty = sum(Qty)) %>%
+  ggplot(aes(x = reorder(Item,Tol_qty), y = Tol_qty, fill = Category)) +
+  geom_bar(stat = 'identity') +
+  theme(axis.text.x = element_text(size = 10)) +
+  coord_flip() +
+  facet_grid(Category~.,scales = "free_y") +
+  labs(x = "Items", y = "Total Qty over time")
+```
+
+*Interpretation*
+
+Apparently, Drip is the most popular product in the coffee shop, Latte comes second. And for food, Croissant and Donut stand out among others. In Extras, Ice shows a significantly high sales as compared to other items. We will now further look into the patterns in Coffee and Extras by Month.
+
+
+*Sales Volume Analysis of Coffee By Month*
+
+Monthly sales are analyzed to see the seasonality and trends in sales.
+
+```{r}
+data %>%
+  filter(Category == 'Coffee') %>%
+  mutate(month = lubridate::month(Date, label = TRUE)) %>%
+  mutate(year = lubridate::year(Date)) %>%
+  group_by(month, year) %>%
+  summarise(Qty = sum(Qty)) %>%
+  ggplot(aes(month, Qty, fill = '#f6b45e')) +
+    stat_summary(fun.y = mean, geom = "bar", na.rm = TRUE) +
+    labs(x = "", y = "Coffee Consumption (in cups)") +
+    theme(panel.background = element_rect(fill = "grey90"), 
+          axis.text.y = element_text(size = 13, colour = "black"),
+          axis.text = element_text(size = 14))
+```
+
+*Interpretation*
+
+Across a year, Central Perk has its best business for Coffee in the Spring and Fall, but business cools down in the months of July and August. This seasonality pattern doesn’t seem reasonable for a coffee shop. Let's look at which coffee type is causing this decline. Is it a hot/cold coffee?
+
+
+*Sales Volume Analysis of each major Coffee (Drip, Latte, Cappucino, Americano) type By Month*
+Let's analyse if there is any specific type of coffee causing this drop during the months of July and August or is the drop is general?
+
+```{r}
+data %>%
+  filter(Item %in% c('Drip', 'Latte', 'Cappucino', 'Americano')) %>%
+  mutate(month = lubridate::month(Date, label = TRUE)) %>%
+  mutate(year = lubridate::year(Date)) %>%
+  group_by(month, year, Item) %>%
+  summarise(Tol_qty = sum(Qty)) %>%
+  ggplot(aes(x = month, y = Tol_qty, fill = Item)) +
+  stat_summary(fun.y = mean, geom = "bar", na.rm = TRUE) +
+  theme(axis.text.x = element_text(size = 10)) +
+  facet_grid(Item~.,scales = "free_y") +
+  labs(x = "Items", y = "Total Qty over time")
+```
+
+*Interpretation*
+
+From the above graph we can see that sales of coffee drop during the month of July and August. These are usually the summer months. We have an intuition that can be related to heat and Ice. Let's look at the distribution of 'Ice' by months.
+
+
+*Sales Volume Analysis of Ice By Month*
+
+Monthly sales are analyzed to see the seasonality and trends in sales.
+
+```{r}
+data %>%
+  filter(Item == 'Ice') %>%
+  mutate(month = lubridate::month(Date, label = TRUE)) %>%
+  mutate(year = lubridate::year(Date)) %>%
+  group_by(month, year) %>%
+  summarise(Qty = sum(Qty)) %>%
+ggplot(aes(month, Qty, fill = '#f6b45e')) +
+    stat_summary(fun.y = mean, geom = "bar", na.rm = TRUE) +
+    labs(x = "", y = "Coffee Consumption (in cups)") +
+    theme(panel.background = element_rect(fill = "grey90"), 
+          axis.text.y = element_text(size = 13, colour = "black"),
+          axis.text = element_text(size = 14))
+```
+
+*Interpretation*
+
+This shows us that due to the increase in temperature, people prefer adding Ice to their coffee. But as we also see a decrease in sales of coffee during these month, our intuition says that coffee sales might have dropped becuase adding Ice to the coffee costs money. This is bad for the client. By gaining some profits from Ice, we are losing on a lot more profit by selling less coffee during the warmer months.
+
+
+*Analysis of coffee sales by time of day and day of week*
+
+```{r}
+data %>%
+  mutate(hour = lubridate::hour(Time)) %>%
+  filter(Item %in% c('Americano','Latte','Cappucino','Drip')) %>% 
+  group_by(day_of_week, hour, Item) %>% 
+  summarise(Qty = sum(Qty)) %>% 
+  ggplot(mapping = aes(x = day_of_week, y = hour, fill = Qty)) +
+  geom_tile(colour = "white") +
+  guides(fill = guide_legend(title = "Sales Volume")) +
+  scale_fill_continuous(low = 'white', high = 'red') +
+  scale_y_reverse(breaks = seq(20,6,-2), labels = seq(20,6,-2), expand = c(0,0)) +
+  scale_x_discrete(expand = c(0,0), position = "top") +
+  labs(title = "Average Coffee Sales Volume by Day of Week / Hour of Day",
+       y = "Hour of Day") +
+  facet_grid(Item ~ .) + 
+  theme_bw() + theme_minimal() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+*Interpretation*
+
+Drip Small at Central Perk sells like hotcakes, especially in the morning from 7am to 10am during Weekdays and 9am to 15pm on Weekends. We might want to prepare ahead of time in terms of material and staffing to smooth the demand.
+
+
+*Analysis on low profit products*
+We looked at products which might be causing a loss to the business and we found that beer is being sold at a very low frequency and generating a loss for the business.
+
+```{r}
+data %>%
+  filter(Category == 'Beers') %>%
+  group_by(Item) %>% summarise(Total_Profit = sum(Profit)) %>%
+  arrange(Total_Profit)
+```
+
+# Recommendations
+
+Below are some recommendations from the insights that our team got from the data. These recommnedations are made keeping in mind that the client is able to implement them across all the coffee stores. Our recommendations are easy to implement and focus directly on increasing profits.
+
+*To increase 'loyal' customers rather than just registered customers, business should take following actions:*
+
+1. Incentivizing repeat visits:
+Introducing an offer on their card, where each coffee purchase earns customers 10 points and they can redeem a free coffee when they collect 100 points. This can be implemented until they become frequent visitors to the store.
+
+2. Sending promotion emails:
+Sending emails to customers who have not made a purchase with us in last 3 months would provide another incentive for customers to keep visiting the shop.
+
+
+*To increase sales by making sure that business is providing the right items to customers at right point of time, business should take following actions:*
+
+1. Leverage tea and non-caffeinated drinks in winter:
+As customers are much more likely to buy tea and non-caffeinated drinks in winter evenings, client should introduce new and special tea, and non-caffeinated drinks. Since customers are more likely to purchase products they see, these items should be displayed on the front of the menu. Posters of novelty items can be displayed outside the store to attract customers. As our customers purchase a lot of beverages and they are likely to try the new drinks, pricing these new introductions slightly higher could potentially drive up the profits. 
+
+2. Increase sales of coffee during afternoon:
+Most of the coffee and food are being sold in the morning and sales drop a lot in afternoon and evening, especially in the summer. This makes sense as people tend to consume less coffee last in the day. To attract customers during afternoon and maintain constant demand, client shoud introduce happy hours from 4 pm to 7 pm, except the weekends. A 10% discount on coffee will attract customers, increase sales and still make a profit on another 10%.
+
+3. Increase sales of food:
+Registered customers like our food and non-registered customers are less likely to buy our food. This indicates that our food has good taste but not attractive to new customers. Client should think about introducing new food items such as food in the store to get customers to the store for these items, if not coffee. Also, client should put food in the center of menu and display cabinet. Staff should ensure that they recommend various food items to new customers to make them aware of the food offerings.
+
+4. Give free Ice during summer months:
+Sales of every coffee drops in July and August i.e. summer months. This is becasue our client is charging extra for ice. As customers like to drink cold coffee in summer, client should stop charging for ice during these months. Profits made by selling more coffee will easily cover the cost of providing free ice.
+
+5. Stop selling beer:
+Looking at the past sales, all the products in beer category are causing a loss to the business. Client would have introduced beers in the past to attract customers, but selling it at a low price is not helping the sales of other products. Our recommendation of 10% off on coffess during afternoon instead of  beers will help achieve this objective. Client should stop selling beers. This will also help in reducing inventory cost and can help support inventory for other items.
+
